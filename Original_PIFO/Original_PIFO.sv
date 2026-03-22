@@ -1,8 +1,8 @@
 /*-----------------------------------------------------------------------------
 Module: Original_PIFO.sv
-Description: A standard register-shift PIFO (Push-In First-Out) implementation.
-             Maintains elements sorted by rank. Supporting N elements.
-             Provides single-cycle push and pop operations.
+Description: Highly optimized register-shift PIFO (Push-In First-Out).
+             Uses carry-chain friendly logic for priority encoding to scale 
+             performance for large N (up to 4096).
 -----------------------------------------------------------------------------*/
 
 module Original_PIFO #(
@@ -31,114 +31,96 @@ module Original_PIFO #(
 );
 
     // Storage for PIFO elements
-    logic [N-1:0]          v_reg;               // Valid bits
-    logic [N-1:0][RW-1:0]  r_reg;               // Rank registers
-    logic [N-1:0][MW-1:0]  m_reg;               // Metadata registers
+    logic [N-1:0]          v_reg;
+    logic [N-1:0][RW-1:0]  r_reg;
+    logic [N-1:0][MW-1:0]  m_reg;
 
-    // Internal wires for the next state
+    // --- 1. Priority Logic (Carry-Chain Friendly) ---
+    // cmp[i] is true if the new element could potentially be inserted at or before i
+    logic [N-1:0] cmp;
+    always_comb begin
+        for (int i = 0; i < N; i++) begin
+            cmp[i] = (!v_reg[i] || (i_push_rank < r_reg[i]));
+        end
+    end
+
+    // Standard carry-chain priority encoder logic
+    logic [N-1:0] cmp_minus_1;
+    assign cmp_minus_1 = cmp - 1'b1;
+
+    // insert_mask has exactly one bit set at the insertion position k
+    logic [N-1:0] insert_mask;
+    assign insert_mask = i_push ? (cmp & ~cmp_minus_1) : '0;
+
+    // mask_thru_k[i] is true if k <= i.
+    logic [N-1:0] mask_thru_k;
+    assign mask_thru_k = cmp | cmp_minus_1;
+    
+    // k_gt_i[i] is true if k > i
+    logic [N-1:0] k_gt_i;
+    assign k_gt_i = ~mask_thru_k;
+
+    // k_lt_i[i] is true if k < i
+    logic [N-1:0] k_lt_i;
+    assign k_lt_i = mask_thru_k & ~insert_mask;
+
+    // --- 2. Next State Logic ---
     logic [N-1:0]          v_next;
     logic [N-1:0][RW-1:0]  r_next;
     logic [N-1:0][MW-1:0]  m_next;
 
-    // Find insertion position
-    // We want to insert such that the array remains sorted (ascending rank)
-    logic [N-1:0] insert_mask;
-    always_comb begin
-        insert_mask = '0;
-        for (int i = 0; i < N; i++) begin
-            if (i_push) begin
-                // Find the first position where the new rank is smaller than the current rank
-                // or the first invalid position.
-                if (!v_reg[i] || (i_push_rank < r_reg[i])) begin
-                    insert_mask[i] = 1'b1;
-                    break;
-                end
-            end
-        end
-    end
-
-    // Helper: Determine if a position is the insertion point
-    // Since we break in the mask generation, only one bit is set or none.
-    
-    // Logic for each slot
     always_comb begin
         v_next = v_reg;
         r_next = r_reg;
         m_next = m_reg;
 
-        case ({i_push, i_pop})
-            2'b10: begin // Push only
-                for (int i = 0; i < N; i++) begin
-                    if (insert_mask[i]) begin
-                        // Insert here
-                        v_next[i] = 1'b1;
-                        r_next[i] = i_push_rank;
-                        m_next[i] = i_push_metadata;
-                        // Shift remaining down
-                        for (int j = i + 1; j < N; j++) begin
-                            v_next[j] = v_reg[j-1];
-                            r_next[j] = r_reg[j-1];
-                            m_next[j] = m_reg[j-1];
-                        end
-                        break;
-                    end
+        for (int i = 0; i < N; i++) begin
+            if (i_push && !i_pop) begin
+                if (insert_mask[i]) begin
+                    v_next[i] = 1'b1;
+                    r_next[i] = i_push_rank;
+                    m_next[i] = i_push_metadata;
+                end else if (k_lt_i[i]) begin
+                    v_next[i] = v_reg[i-1];
+                    r_next[i] = r_reg[i-1];
+                    m_next[i] = m_reg[i-1];
                 end
-            end
-
-            2'b01: begin // Pop only
-                // Shift all up
-                for (int i = 0; i < N - 1; i++) begin
+                // else: k > i, stay
+            end 
+            else if (!i_push && i_pop) begin
+                if (i < N - 1) begin
                     v_next[i] = v_reg[i+1];
                     r_next[i] = r_reg[i+1];
                     m_next[i] = m_reg[i+1];
-                end
-                v_next[N-1] = 1'b0;
-                r_next[N-1] = '0;
-                m_next[N-1] = '0;
-            end
-
-            2'b11: begin // Push and Pop simultaneously
-                // The head (index 0) is popped.
-                // Elements from 1 up to the insertion point shift up.
-                // The new element is inserted.
-                // Elements after the insertion point stay in place.
-                
-                // Logic:
-                // If insert_mask[0] is set, the new element just replaces the popped head.
-                // Otherwise, elements [1...pos] shift up to [0...pos-1], and pos becomes the new element.
-                
-                for (int i = 0; i < N; i++) begin
-                    if (insert_mask[i]) begin
-                        // Shift elements before i up by 1 (to fill the pop at index 0)
-                        for (int j = 0; j < i; j++) begin
-                            v_next[j] = v_reg[j+1];
-                            r_next[j] = r_reg[j+1];
-                            m_next[j] = m_reg[j+1];
-                        end
-                        // Insert at i-1 if i > 0, or at 0 if i == 0.
-                        // Wait, if i is the insertion point in the original array,
-                        // and we pop index 0, the new insertion point is i-1.
-                        if (i == 0) begin
-                            v_next[0] = 1'b1;
-                            r_next[0] = i_push_rank;
-                            m_next[0] = i_push_metadata;
-                        end else begin
-                            v_next[i-1] = 1'b1;
-                            r_next[i-1] = i_push_rank;
-                            m_next[i-1] = i_push_metadata;
-                        end
-                        // Elements from i onwards stay in their original positions.
-                        // (They shifted up due to pop, but shifted down due to push)
-                        break;
-                    end
+                end else begin
+                    v_next[i] = 1'b0;
+                    r_next[i] = '0;
+                    m_next[i] = '0;
                 end
             end
-
-            default: ; // No op
-        endcase
+            else if (i_push && i_pop) begin
+                if (i < N - 1 && k_gt_i[i+1]) begin
+                    v_next[i] = v_reg[i+1];
+                    r_next[i] = r_reg[i+1];
+                    m_next[i] = m_reg[i+1];
+                end else if (i < N - 1 && insert_mask[i+1]) begin
+                    v_next[i] = 1'b1;
+                    r_next[i] = i_push_rank;
+                    m_next[i] = i_push_metadata;
+                end else if (insert_mask[i] && i == 0) begin
+                    v_next[i] = 1'b1;
+                    r_next[i] = i_push_rank;
+                    m_next[i] = i_push_metadata;
+                end else begin
+                    v_next[i] = v_reg[i];
+                    r_next[i] = r_reg[i];
+                    m_next[i] = m_reg[i];
+                end
+            end
+        end
     end
 
-    // Sequential logic
+    // Sequential
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             v_reg <= '0;
@@ -151,22 +133,22 @@ module Original_PIFO #(
         end
     end
 
-    // Output assignments
-    assign o_pop_valid    = v_reg[0];
-    assign o_pop_rank     = r_reg[0];
-    assign o_pop_metadata = m_reg[0];
+    // --- 3. Status Logic ---
+    logic [$clog2(N+1)-1:0] count_reg;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) count_reg <= '0;
+        else begin
+            if (i_push && !i_pop && !o_full)  count_reg <= count_reg + 1'b1;
+            else if (!i_push && i_pop && !o_empty) count_reg <= count_reg - 1'b1;
+        end
+    end
 
+    assign o_count = count_reg;
     assign o_empty = !v_reg[0];
     assign o_full  = v_reg[N-1];
 
-    // Count calculation
-    logic [$clog2(N+1)-1:0] count;
-    always_comb begin
-        count = '0;
-        for (int i = 0; i < N; i++) begin
-            if (v_reg[i]) count = count + 1;
-        end
-    end
-    assign o_count = count;
+    assign o_pop_valid    = v_reg[0];
+    assign o_pop_rank     = r_reg[0];
+    assign o_pop_metadata = m_reg[0];
 
 endmodule
